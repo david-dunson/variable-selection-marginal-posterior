@@ -1,0 +1,547 @@
+getwd()
+BGAMP <- function(y, A, lambda, psi, sigma.sq, theta = 1) {#
+#
+# Set hyperparameters for the Bernoulli-Gaussian / spike-and-slab prior#
+dzeta = 0 # Mean of the normal#
+#
+# Initialization for the AMP algorithm#
+n.iter = 10 # Maximum number of iterations for AMP algorithm#
+n = length(A[1,]) # Number of predictors#
+m = length(A[,1]) # Sample size#
+x.hat = matrix(lambda*dzeta, nrow = n.iter, ncol = n) # Initialize vector of parameter estimates at prior mean#
+tau.x = matrix(lambda^2*psi, nrow = n.iter, ncol = n) # Initialize vector of variances at prior variance#
+s = matrix(0, nrow = n.iter, ncol = m) # Note that row indexing starts at 0 in Andersen's thesis#
+z = matrix(0, nrow = n.iter, ncol = m)#
+tau.p = matrix(0, nrow = n.iter, ncol = m)#
+p.hat = matrix(0, nrow = n.iter, ncol = m)#
+tau.z = matrix(0, nrow = n.iter, ncol = m)#
+tau.s = matrix(0, nrow = n.iter, ncol = m)#
+tau.r = matrix(0, nrow = n.iter, ncol = n)#
+r.hat = matrix(0, nrow = n.iter, ncol = n)#
+pi = matrix(0, nrow = n.iter, ncol = n)#
+counter <- 0#
+#
+# The AMP algorithm#
+for(k in 1:(n.iter-1)) {#
+	counter <- counter+1#
+	#if(counter == n.iter-1) print("Warning: Maximum number of iterations reached")#
+	# Step 1#
+	for(a in 1:m) {#
+		z[k,a] <- A[a,]%*%x.hat[k,]#
+		tau.p[k,a] <- A[a,]^2%*%tau.x[k,]#
+		p.hat[k,a] <- z[k,a]-tau.p[k,a]*s[k,a]#
+	}#
+	# Step 2#
+	for(a in 1:m) {#
+		tau.z[k,a] <- tau.p[k,a]*sigma.sq/(tau.p[k,a]+sigma.sq) # Var(z_a|y,p.hat[k,a],tau.p[k,a])#
+		z.hat <- tau.z[k,a]*(y[a]/sigma.sq+p.hat[k,a]/tau.p[k,a]) # E(z.a|y,p.hat[k,a],tau.p[k,a])#
+		# Dampened:#
+		s[k+1,a] <- (1-theta)*s[k,a] + theta*(z.hat-p.hat[k,a])/tau.p[k,a]#
+		tau.s[k,a] <- (1-tau.z[k,a]/tau.p[k,a])/tau.p[k,a]#
+	}#
+	# Step 3#
+	for(i in 1:n) {#
+		tau.r[k,i] <- 1/A[,i]^2%*%tau.s[k,]#
+		r.hat[k,i] <- x.hat[k,i]+tau.r[k,i]*A[,i]%*%s[k+1,]#
+	}#
+	# Step 4#
+	for(i in 1:n) {#
+		pi[k,i] <- 1/(1+(1-lambda)*dnorm(0, r.hat[k,i], sqrt(tau.r[k,i]))/(lambda*dnorm(0, dzeta-r.hat[k,i], sqrt(psi+tau.r[k,i]))))#
+		nu <- 1/(1/psi+1/tau.r[k,i])#
+		gamma <- (dzeta/psi+r.hat[k,i]/tau.r[k,i])*nu#
+		# Dampened:#
+		x.hat[k+1,i] <- (1-theta)*x.hat[k+1,i] + theta*pi[k,i]*gamma # E(x_i|y,r.hat[k,i],tau.r[k,i])#
+		tau.x[k+1,i] <- pi[k,i]*(gamma^2-pi[k,i]*gamma^2+nu) # Var(x_i|y,r.hat[k,i],tau.r[k,i])#
+	}#
+	#if(is.na(sd(x.hat[k,]-x.hat[k+1,]) < 1E-9)) return(BGAMP(y, A, lambda, psi, sigma.sq, theta/2)) # If AMP fails to converge, add dampening#
+	#else if(sd(x.hat[k,]-x.hat[k+1,]) < 1E-9) break # Stop iterating if AMP has sufficiently converged#
+}#
+#
+return(list(mean=x.hat[counter,], var=tau.x[counter,], incProb=pi[counter,]))#
+#
+}#
+l.marginal.likelihood.lm <- function(y, X, psi, sigma.sq) {#
+	if(length(dim(X)) == 2) Phi <- t(X)%*%X + (sigma.sq/psi)*diag(length(X[1,]))#
+	else Phi <- t(X)%*%X + sigma.sq/psi#
+	return( ( t(y)%*%X%*%solve(Phi)%*%t(X)%*%y / (2*sigma.sq) )  - ( length(X[1,])* (log(psi) - log(sigma.sq) ) + log(det(Phi)) )/2 )#
+}#
+library(pracma) # For gramSchmidt#
+bothRotated <- function(y, X, lambda, psi, sigma.sq, m = 3, n.rep = 10) {#
+	n <- length(y) # Sample size#
+	p <- length(X[1,]) # Number of predictors#
+	est.post.mean <- NULL#
+	est.post.inc.prob <- NULL#
+	AMPincProb <- NULL#
+	BCRincProb <- NULL#
+	for(j in 1:p) {#
+	eigen.decom <- eigen(diag(n)-X[,j]%*%t(X[,j])/(t(X[,j])%*%X[,j])[1,1], symmetric = T)#
+	Q.j <- diag(sqrt(eigen.decom$values[-n]))%*%t(eigen.decom$vectors[,-n])#
+	AMP <- BGAMP(Q.j%*%y, Q.j%*%X[,-j], lambda, psi, sigma.sq)#
+	mu.star <- t(X[,j])%*%X[,-j]%*%AMP$mean#
+	sigma.sq.star <- t(X[,j])%*%( X[,-j]%*%diag(AMP$var)%*%t(X[,-j]) + sigma.sq*diag(length(y)))%*%X[,j]#
+	sigma.sq0 <- 1/( (t(X[,j])%*%X[,j])^2/sigma.sq.star + 1/psi )#
+	#mean0 <- sigma.sq0*(t(X[,j])%*%y-mu.star)*(t(X[,j])%*%X[,j])/sigma.sq.star#
+	C0 <- dnorm(t(X[,j])%*%y, mean = mu.star, sd = sqrt((t(X[,j])%*%X[,j])^2*psi+sigma.sq.star))#
+	est.post.inc.prob[j] <- C0/( C0+dnorm(t(X[,j])%*%y, mean=mu.star, sd=sqrt(sigma.sq.star)) )#
+	#est.post.mean[j] <- est.post.inc.prob[j]*mean0#
+	#AMPmean <- est.post.mean#
+	AMPincProb[j] <- est.post.inc.prob[j]#
+	ll2 <- matrix(nrow = n.rep, ncol = p)#
+	incP2 <- matrix(nrow = n.rep, ncol = p)#
+	Q.2 <- list()#
+	x.new <- matrix(nrow = p, ncol = p-1)#
+	s <- NULL#
+	z <- NULL#
+	y.tilde <- matrix(nrow = p, ncol = n-1)#
+	y.tilde[j,] <- Q.j%*%y#
+	{#
+		s[j] <- sqrt(sum(X[,j]^2))#
+		q.1 <- X[,j]/s[j]#
+		x.new[j,] <- t(q.1)%*%X[,-j]#
+		eigen.decom <- eigen(diag(n)-q.1%*%t(q.1), symmetric = T)#
+		Q.2[[j]] <- eigen.decom$vectors[,-n]%*%diag(sqrt(eigen.decom$values[-n]))#
+		z[j] <- t(X[,j]/s[j])%*%y#
+	}#
+	for(r in 1:n.rep) {#
+		theta <- runif(1, min = .1, max = .9)#
+		Theta <- matrix(0, nrow = p-1, ncol = m)#
+		while(qr(Theta)$rank < m) {#
+			for(i in 1:(p-1)) for(jj in 1:m) {#
+			u <- runif(1)#
+			if(u < theta^2)						Theta[i,jj] <- -sqrt(1/theta)#
+			else if(u < 1-2*theta+2*theta^2)		Theta[i,jj] <- sqrt(1/theta)#
+			}#
+		}#
+		Theta <- gramSchmidt(Theta)$Q#
+		A <- Q.j%*%X[,-j]%*%Theta#
+			# Posterior mean for gamma (parameters after compression)#
+			gam.star <- solve(t(A)%*%A+diag(x = 1/psi, nrow = m))%*%t(A)%*%y.tilde[j,]#
+			Sigma.hat <- solve( t(A)%*%A+diag(x = 1/psi, nrow = m) )#
+			mu <- t(x.new[j,])%*%Theta%*%gam.star#
+			tau.sq <- t(x.new[j,])%*%Theta%*%Sigma.hat%*%t(Theta)%*%x.new[j,]+1#
+			ll2[r,j] <- l.marginal.likelihood.lm(y.tilde[j,], A, psi, sigma.sq)#
+			l.0 <- dnorm((z[j]-mu)/sqrt(sigma.sq*tau.sq), log = T)#
+			l.j <- dnorm((z[j]-mu)/sqrt(sigma.sq*tau.sq+s[j]^2*psi), log = T)#
+			incP2[r,j] <- 1 / ( 1+( (1-lambda) / lambda ) * exp(l.0-l.j) )#
+	}#
+	{#
+		l.sum <- ll2[r,j]#
+		for(r in 2:n.rep) l.sum <- l.sum+log(1+exp(ll2[r,j]-l.sum))#
+		weights <- exp(ll2[,j]-l.sum)#
+		BCRincProb[j] <- sum(weights*incP2[,j])#
+	}#
+	} # End j loop#
+	return(list(#
+		AMPincProb=AMPincProb,#
+		BCRincProb=BCRincProb#
+	))#
+}#
+library(R.utils) # for intToBin()#
+marginal.likelihood <- function(y, X, lambda, psi, sigma.sq) {#
+	p = length(X[1,]) # Number of predictors#
+	n = length(y) # Sample size#
+	sum <- (1-lambda)^p # The marginal likelihood of the model without predictors is proportional to this#
+	for(k in 1:(2^p-1)) {#
+		gam <- rep(0, p)#
+		gam[min(p-ceiling(log2(k+1)-1),p):p] <- as.numeric(strsplit(intToBin(k), split = "")[[1]])#
+		X.gam <- X[,which(gam==1)]#
+		s.gam <- sum(gam)#
+		sum <- sum + lambda^s.gam*(1-lambda)^(p-s.gam)* marginal.likelihood.lm(y, X.gam, psi, sigma.sq)#
+	}#
+	return(sum)#
+}#
+post.mean <- function(y, X, lambda.star, psi, sigma.sq) {#
+	p = length(X[1,]) # Number of predictors#
+	n = length(y) # Sample size#
+	mean <- rep(0, p)#
+	for(k in 1:(2^p-1)) {#
+		gam <- rep(0, p)#
+		gam[min(p-ceiling(log2(k+1)-1),p):p] <- as.numeric(strsplit(intToBin(k), split = "")[[1]])#
+		X.gam <- X[,which(gam==1)]#
+		Phi <- t(X.gam)%*%X.gam + (sigma.sq/psi)*diag(sum(gam))#
+		mean[gam==1] <- mean[gam==1] + prod(lambda.star[gam==1])*prod(1-lambda.star[gam==0])*solve(Phi)%*%t(X.gam)%*%y#
+	}#
+	return(mean)#
+}#
+marginal.likelihood.lm <- function(y, X, psi, sigma.sq) {#
+	if(length(dim(X)) == 2) Phi <- t(X)%*%X + (sigma.sq/psi)*diag(length(X[1,]))#
+	else Phi <- t(X)%*%X + sigma.sq/psi#
+	return( exp( t(y)%*%X%*%solve(Phi)%*%t(X)%*%y / (2*sigma.sq) )  * det(( psi/sigma.sq )*Phi)^(-.5) )#
+}#
+exact <- function(y, A, lambda, psi, sigma.sq) {#
+	incProb <- NULL#
+	marginalLikelihood <- marginal.likelihood(y, A, lambda, psi, sigma.sq)#
+	for(j in 1:length(A[1,])) {#
+		marginalLikelihoodj <- marginal.likelihood(y, A[,-j], lambda, psi, sigma.sq)#
+		incProb[j] <- 1-(1-lambda)*marginalLikelihoodj/marginalLikelihood#
+	}#
+	return(list(mean=post.mean(y, A, incProb, psi, sigma.sq), incProb=incProb))#
+}#
+# Generate data similar to first example in Tibshirani's lasso paper#
+gendata <- function(n, p, rho, SNR) {#
+	beta <- rep(0,p)#
+	beta[1] <- 3#
+	beta[2] <- 1.5#
+	beta[3] <- 2#
+	sigma.sq <- sum(beta^2)/SNR#
+	X <- matrix(rnorm(n*p), nrow = n, ncol = p)#
+	for(j in 2:p) X[,j] <- rho*X[,j-1]+sqrt(1-rho^2)*X[,j]#
+	X <- scale(X)#
+	y <- X%*%beta+rnorm(n, mean = 0, sd = sqrt(sigma.sq))#
+	lambda <- 3/p#
+	return(list(beta=beta, lambda=lambda, X=X, y=y, sigma.sq=sigma.sq))#
+}#
+n <- 100#
+p <- 12#
+MSEf <- function(rho) {#
+	if(exists("lambda")) rm(beta, lambda, X, y, sigma.sq, pos = 2L)#
+	attach(gendata(n = n, p = p, rho = rho, SNR = 2))#
+	psi = 10*sigma.sq#
+	ex <- exact(y, X, lambda, psi, sigma.sq)$incProb#
+	#AMP <- normalApprox.AMP(y, X, lambda, psi, sigma.sq)$incProb#
+	#BCRincProb <- BCR(y, X, lambda, psi, sigma.sq, m = 5)$incProb#
+	res <- bothRotated(y, X, lambda, psi, sigma.sq, m = 3)#
+	#print(ex)#
+	#print(res)#
+	return( c( mean((ex-res$AMPincProb)^2), mean((ex-res$BCRincProb)^2), ex, res$AMPincProb, res$BCRincProb ) )#
+}#
+#
+n.rep <- 100 # Number of repeats per rho#
+g.rho <- 0:9/10 # Grid of rho values#
+n.rho <- length(g.rho)#
+#
+MSEs <- array(dim = c(n.rho, n.rep, 2+3*p))#
+#
+for(rho in g.rho) for(r in 1:n.rep) {#
+	print(paste(rho, r))#
+	MSEs[which(g.rho == rho), r, ] <- MSEf(rho)#
+}#
+#
+save(MSEs, file = paste("MSEn", n, "p", p, "SNR", SNR, "rep", n.rep, sep=''))#
+AMP1 <- NULL#
+AMP2 <- NULL#
+AMP3 <- NULL#
+#
+BCR1 <- NULL#
+BCR2 <- NULL#
+BCR3 <- NULL#
+for(r in 1:n.rho) {#
+	AMP <- sort(MSEs[r,,1])#
+	AMP1[r] <- quantile(AMP, .2)#
+	AMP2[r] <- mean(AMP)#
+	AMP3[r] <- quantile(AMP, .8)#
+	BCR <- sort(MSEs[r,,2])#
+	BCR1[r] <- quantile(BCR, .2)#
+	BCR2[r] <- mean(BCR)#
+	BCR3[r] <- quantile(BCR, .8)#
+}#
+# Create plot#
+#
+w <- 4#
+h <- 2#
+margins <- c(4,4,0,0)#
+rho <- g.rho#
+rho1 <- rho-.01#
+rho2 <- rho+.01#
+pdf(file = paste("MSEn", n, "p", p, "SNR2rep", n.rep, ".pdf", sep=''), width = w, height = h)#
+par(mar=margins)#
+plot(rho1, AMP3, col = 'red', ylim = c(0,1), type = 'n', ylab = 'MSE', xlab = 'rho')#
+segments(x0 = rho1, y0 = AMP1, y1 = AMP3, col = 'red')#
+points(rho1, AMP2, col = 'red', pch = 20)#
+#
+segments(x0 = rho2, y0 = BCR1, y1 = BCR3, col = 'blue')#
+points(rho2, BCR2, col = 'blue', pch = 20)#
+dev.off()#
+for(r in 1:n.rho) {#
+	AMP <- sort(abs(1-MSEs[r,,p+2+(1:p)]/MSEs[r,,2+(1:p)]))#
+	AMP1[r] <- quantile(AMP, .2)#
+	AMP2[r] <- mean(AMP)#
+	AMP3[r] <- quantile(AMP, .8)#
+	BCR <- abs(1-MSEs[r,,2*p+2+(1:p)]/MSEs[r,,2+(1:p)])#
+	BCR1[r] <- quantile(BCR, .2)#
+	BCR2[r] <- mean(BCR)#
+	BCR3[r] <- quantile(BCR, .8)#
+}#
+#
+pdf(file = paste("relEn", n, "p", p, "SNR2rep", n.rep, ".pdf", sep=''), width = w, height = h)#
+par(mar=margins)#
+plot(rho1, AMP3, col = 'red', ylim = c(0,1), type = 'n', ylab = 'Relative error', xlab = 'rho')#
+segments(x0 = rho1, y0 = AMP1, y1 = AMP3, col = 'red')#
+points(rho1, AMP2, col = 'red', pch = 20)#
+#
+segments(x0 = rho2, y0 = BCR1, y1 = BCR3, col = 'blue')#
+points(rho2, BCR2, col = 'blue', pch = 20)#
+dev.off()
+BGAMP <- function(y, A, lambda, psi, sigma.sq, theta = 1) {#
+#
+# Set hyperparameters for the Bernoulli-Gaussian / spike-and-slab prior#
+dzeta = 0 # Mean of the normal#
+#
+# Initialization for the AMP algorithm#
+n.iter = 10 # Maximum number of iterations for AMP algorithm#
+n = length(A[1,]) # Number of predictors#
+m = length(A[,1]) # Sample size#
+x.hat = matrix(lambda*dzeta, nrow = n.iter, ncol = n) # Initialize vector of parameter estimates at prior mean#
+tau.x = matrix(lambda^2*psi, nrow = n.iter, ncol = n) # Initialize vector of variances at prior variance#
+s = matrix(0, nrow = n.iter, ncol = m) # Note that row indexing starts at 0 in Andersen's thesis#
+z = matrix(0, nrow = n.iter, ncol = m)#
+tau.p = matrix(0, nrow = n.iter, ncol = m)#
+p.hat = matrix(0, nrow = n.iter, ncol = m)#
+tau.z = matrix(0, nrow = n.iter, ncol = m)#
+tau.s = matrix(0, nrow = n.iter, ncol = m)#
+tau.r = matrix(0, nrow = n.iter, ncol = n)#
+r.hat = matrix(0, nrow = n.iter, ncol = n)#
+pi = matrix(0, nrow = n.iter, ncol = n)#
+counter <- 0#
+#
+# The AMP algorithm#
+for(k in 1:(n.iter-1)) {#
+	counter <- counter+1#
+	#if(counter == n.iter-1) print("Warning: Maximum number of iterations reached")#
+	# Step 1#
+	for(a in 1:m) {#
+		z[k,a] <- A[a,]%*%x.hat[k,]#
+		tau.p[k,a] <- A[a,]^2%*%tau.x[k,]#
+		p.hat[k,a] <- z[k,a]-tau.p[k,a]*s[k,a]#
+	}#
+	# Step 2#
+	for(a in 1:m) {#
+		tau.z[k,a] <- tau.p[k,a]*sigma.sq/(tau.p[k,a]+sigma.sq) # Var(z_a|y,p.hat[k,a],tau.p[k,a])#
+		z.hat <- tau.z[k,a]*(y[a]/sigma.sq+p.hat[k,a]/tau.p[k,a]) # E(z.a|y,p.hat[k,a],tau.p[k,a])#
+		# Dampened:#
+		s[k+1,a] <- (1-theta)*s[k,a] + theta*(z.hat-p.hat[k,a])/tau.p[k,a]#
+		tau.s[k,a] <- (1-tau.z[k,a]/tau.p[k,a])/tau.p[k,a]#
+	}#
+	# Step 3#
+	for(i in 1:n) {#
+		tau.r[k,i] <- 1/A[,i]^2%*%tau.s[k,]#
+		r.hat[k,i] <- x.hat[k,i]+tau.r[k,i]*A[,i]%*%s[k+1,]#
+	}#
+	# Step 4#
+	for(i in 1:n) {#
+		pi[k,i] <- 1/(1+(1-lambda)*dnorm(0, r.hat[k,i], sqrt(tau.r[k,i]))/(lambda*dnorm(0, dzeta-r.hat[k,i], sqrt(psi+tau.r[k,i]))))#
+		nu <- 1/(1/psi+1/tau.r[k,i])#
+		gamma <- (dzeta/psi+r.hat[k,i]/tau.r[k,i])*nu#
+		# Dampened:#
+		x.hat[k+1,i] <- (1-theta)*x.hat[k+1,i] + theta*pi[k,i]*gamma # E(x_i|y,r.hat[k,i],tau.r[k,i])#
+		tau.x[k+1,i] <- pi[k,i]*(gamma^2-pi[k,i]*gamma^2+nu) # Var(x_i|y,r.hat[k,i],tau.r[k,i])#
+	}#
+	#if(is.na(sd(x.hat[k,]-x.hat[k+1,]) < 1E-9)) return(BGAMP(y, A, lambda, psi, sigma.sq, theta/2)) # If AMP fails to converge, add dampening#
+	#else if(sd(x.hat[k,]-x.hat[k+1,]) < 1E-9) break # Stop iterating if AMP has sufficiently converged#
+}#
+#
+return(list(mean=x.hat[counter,], var=tau.x[counter,], incProb=pi[counter,]))#
+#
+}#
+l.marginal.likelihood.lm <- function(y, X, psi, sigma.sq) {#
+	if(length(dim(X)) == 2) Phi <- t(X)%*%X + (sigma.sq/psi)*diag(length(X[1,]))#
+	else Phi <- t(X)%*%X + sigma.sq/psi#
+	return( ( t(y)%*%X%*%solve(Phi)%*%t(X)%*%y / (2*sigma.sq) )  - ( length(X[1,])* (log(psi) - log(sigma.sq) ) + log(det(Phi)) )/2 )#
+}#
+library(pracma) # For gramSchmidt#
+bothRotated <- function(y, X, lambda, psi, sigma.sq, m = 3, n.rep = 10) {#
+	n <- length(y) # Sample size#
+	p <- length(X[1,]) # Number of predictors#
+	est.post.mean <- NULL#
+	est.post.inc.prob <- NULL#
+	AMPincProb <- NULL#
+	BCRincProb <- NULL#
+	for(j in 1:p) {#
+	eigen.decom <- eigen(diag(n)-X[,j]%*%t(X[,j])/(t(X[,j])%*%X[,j])[1,1], symmetric = T)#
+	Q.j <- diag(sqrt(eigen.decom$values[-n]))%*%t(eigen.decom$vectors[,-n])#
+	AMP <- BGAMP(Q.j%*%y, Q.j%*%X[,-j], lambda, psi, sigma.sq)#
+	mu.star <- t(X[,j])%*%X[,-j]%*%AMP$mean#
+	sigma.sq.star <- t(X[,j])%*%( X[,-j]%*%diag(AMP$var)%*%t(X[,-j]) + sigma.sq*diag(length(y)))%*%X[,j]#
+	sigma.sq0 <- 1/( (t(X[,j])%*%X[,j])^2/sigma.sq.star + 1/psi )#
+	#mean0 <- sigma.sq0*(t(X[,j])%*%y-mu.star)*(t(X[,j])%*%X[,j])/sigma.sq.star#
+	C0 <- dnorm(t(X[,j])%*%y, mean = mu.star, sd = sqrt((t(X[,j])%*%X[,j])^2*psi+sigma.sq.star))#
+	est.post.inc.prob[j] <- C0/( C0+dnorm(t(X[,j])%*%y, mean=mu.star, sd=sqrt(sigma.sq.star)) )#
+	#est.post.mean[j] <- est.post.inc.prob[j]*mean0#
+	#AMPmean <- est.post.mean#
+	AMPincProb[j] <- est.post.inc.prob[j]#
+	ll2 <- matrix(nrow = n.rep, ncol = p)#
+	incP2 <- matrix(nrow = n.rep, ncol = p)#
+	Q.2 <- list()#
+	x.new <- matrix(nrow = p, ncol = p-1)#
+	s <- NULL#
+	z <- NULL#
+	y.tilde <- matrix(nrow = p, ncol = n-1)#
+	y.tilde[j,] <- Q.j%*%y#
+	{#
+		s[j] <- sqrt(sum(X[,j]^2))#
+		q.1 <- X[,j]/s[j]#
+		x.new[j,] <- t(q.1)%*%X[,-j]#
+		eigen.decom <- eigen(diag(n)-q.1%*%t(q.1), symmetric = T)#
+		Q.2[[j]] <- eigen.decom$vectors[,-n]%*%diag(sqrt(eigen.decom$values[-n]))#
+		z[j] <- t(X[,j]/s[j])%*%y#
+	}#
+	for(r in 1:n.rep) {#
+		theta <- runif(1, min = .1, max = .9)#
+		Theta <- matrix(0, nrow = p-1, ncol = m)#
+		while(qr(Theta)$rank < m) {#
+			for(i in 1:(p-1)) for(jj in 1:m) {#
+			u <- runif(1)#
+			if(u < theta^2)						Theta[i,jj] <- -sqrt(1/theta)#
+			else if(u < 1-2*theta+2*theta^2)		Theta[i,jj] <- sqrt(1/theta)#
+			}#
+		}#
+		Theta <- gramSchmidt(Theta)$Q#
+		A <- Q.j%*%X[,-j]%*%Theta#
+			# Posterior mean for gamma (parameters after compression)#
+			gam.star <- solve(t(A)%*%A+diag(x = 1/psi, nrow = m))%*%t(A)%*%y.tilde[j,]#
+			Sigma.hat <- solve( t(A)%*%A+diag(x = 1/psi, nrow = m) )#
+			mu <- t(x.new[j,])%*%Theta%*%gam.star#
+			tau.sq <- t(x.new[j,])%*%Theta%*%Sigma.hat%*%t(Theta)%*%x.new[j,]+1#
+			ll2[r,j] <- l.marginal.likelihood.lm(y.tilde[j,], A, psi, sigma.sq)#
+			l.0 <- dnorm((z[j]-mu)/sqrt(sigma.sq*tau.sq), log = T)#
+			l.j <- dnorm((z[j]-mu)/sqrt(sigma.sq*tau.sq+s[j]^2*psi), log = T)#
+			incP2[r,j] <- 1 / ( 1+( (1-lambda) / lambda ) * exp(l.0-l.j) )#
+	}#
+	{#
+		l.sum <- ll2[r,j]#
+		for(r in 2:n.rep) l.sum <- l.sum+log(1+exp(ll2[r,j]-l.sum))#
+		weights <- exp(ll2[,j]-l.sum)#
+		BCRincProb[j] <- sum(weights*incP2[,j])#
+	}#
+	} # End j loop#
+	return(list(#
+		AMPincProb=AMPincProb,#
+		BCRincProb=BCRincProb#
+	))#
+}#
+library(R.utils) # for intToBin()#
+marginal.likelihood <- function(y, X, lambda, psi, sigma.sq) {#
+	p = length(X[1,]) # Number of predictors#
+	n = length(y) # Sample size#
+	sum <- (1-lambda)^p # The marginal likelihood of the model without predictors is proportional to this#
+	for(k in 1:(2^p-1)) {#
+		gam <- rep(0, p)#
+		gam[min(p-ceiling(log2(k+1)-1),p):p] <- as.numeric(strsplit(intToBin(k), split = "")[[1]])#
+		X.gam <- X[,which(gam==1)]#
+		s.gam <- sum(gam)#
+		sum <- sum + lambda^s.gam*(1-lambda)^(p-s.gam)* marginal.likelihood.lm(y, X.gam, psi, sigma.sq)#
+	}#
+	return(sum)#
+}#
+post.mean <- function(y, X, lambda.star, psi, sigma.sq) {#
+	p = length(X[1,]) # Number of predictors#
+	n = length(y) # Sample size#
+	mean <- rep(0, p)#
+	for(k in 1:(2^p-1)) {#
+		gam <- rep(0, p)#
+		gam[min(p-ceiling(log2(k+1)-1),p):p] <- as.numeric(strsplit(intToBin(k), split = "")[[1]])#
+		X.gam <- X[,which(gam==1)]#
+		Phi <- t(X.gam)%*%X.gam + (sigma.sq/psi)*diag(sum(gam))#
+		mean[gam==1] <- mean[gam==1] + prod(lambda.star[gam==1])*prod(1-lambda.star[gam==0])*solve(Phi)%*%t(X.gam)%*%y#
+	}#
+	return(mean)#
+}#
+marginal.likelihood.lm <- function(y, X, psi, sigma.sq) {#
+	if(length(dim(X)) == 2) Phi <- t(X)%*%X + (sigma.sq/psi)*diag(length(X[1,]))#
+	else Phi <- t(X)%*%X + sigma.sq/psi#
+	return( exp( t(y)%*%X%*%solve(Phi)%*%t(X)%*%y / (2*sigma.sq) )  * det(( psi/sigma.sq )*Phi)^(-.5) )#
+}#
+exact <- function(y, A, lambda, psi, sigma.sq) {#
+	incProb <- NULL#
+	marginalLikelihood <- marginal.likelihood(y, A, lambda, psi, sigma.sq)#
+	for(j in 1:length(A[1,])) {#
+		marginalLikelihoodj <- marginal.likelihood(y, A[,-j], lambda, psi, sigma.sq)#
+		incProb[j] <- 1-(1-lambda)*marginalLikelihoodj/marginalLikelihood#
+	}#
+	return(list(mean=post.mean(y, A, incProb, psi, sigma.sq), incProb=incProb))#
+}#
+# Generate data similar to first example in Tibshirani's lasso paper#
+gendata <- function(n, p, rho, SNR) {#
+	beta <- rep(0,p)#
+	beta[1] <- 3#
+	beta[2] <- 1.5#
+	beta[3] <- 2#
+	sigma.sq <- sum(beta^2)/SNR#
+	X <- matrix(rnorm(n*p), nrow = n, ncol = p)#
+	for(j in 2:p) X[,j] <- rho*X[,j-1]+sqrt(1-rho^2)*X[,j]#
+	X <- scale(X)#
+	y <- X%*%beta+rnorm(n, mean = 0, sd = sqrt(sigma.sq))#
+	lambda <- 3/p#
+	return(list(beta=beta, lambda=lambda, X=X, y=y, sigma.sq=sigma.sq))#
+}#
+n <- 100#
+p <- 12#
+MSEf <- function(rho) {#
+	if(exists("lambda")) rm(beta, lambda, X, y, sigma.sq, pos = 2L)#
+	attach(gendata(n = n, p = p, rho = rho, SNR = 2))#
+	psi = 10*sigma.sq#
+	ex <- exact(y, X, lambda, psi, sigma.sq)$incProb#
+	#AMP <- normalApprox.AMP(y, X, lambda, psi, sigma.sq)$incProb#
+	#BCRincProb <- BCR(y, X, lambda, psi, sigma.sq, m = 5)$incProb#
+	res <- bothRotated(y, X, lambda, psi, sigma.sq, m = 3)#
+	#print(ex)#
+	#print(res)#
+	return( c( mean((ex-res$AMPincProb)^2), mean((ex-res$BCRincProb)^2), ex, res$AMPincProb, res$BCRincProb ) )#
+}#
+#
+n.rep <- 10 # Number of repeats per rho#
+g.rho <- 0:9/10 # Grid of rho values#
+n.rho <- length(g.rho)#
+#
+MSEs <- array(dim = c(n.rho, n.rep, 2+3*p))#
+#
+for(rho in g.rho) for(r in 1:n.rep) {#
+	print(paste(rho, r))#
+	MSEs[which(g.rho == rho), r, ] <- MSEf(rho)#
+}#
+#
+save(MSEs, file = paste("MSEn", n, "p", p, "SNR", SNR, "rep", n.rep, sep=''))#
+AMP1 <- NULL#
+AMP2 <- NULL#
+AMP3 <- NULL#
+#
+BCR1 <- NULL#
+BCR2 <- NULL#
+BCR3 <- NULL#
+for(r in 1:n.rho) {#
+	AMP <- sort(MSEs[r,,1])#
+	AMP1[r] <- quantile(AMP, .2)#
+	AMP2[r] <- mean(AMP)#
+	AMP3[r] <- quantile(AMP, .8)#
+	BCR <- sort(MSEs[r,,2])#
+	BCR1[r] <- quantile(BCR, .2)#
+	BCR2[r] <- mean(BCR)#
+	BCR3[r] <- quantile(BCR, .8)#
+}#
+# Create plot#
+#
+w <- 4#
+h <- 2#
+margins <- c(4,4,0,0)#
+rho <- g.rho#
+rho1 <- rho-.01#
+rho2 <- rho+.01#
+pdf(file = paste("MSEn", n, "p", p, "SNR2rep", n.rep, ".pdf", sep=''), width = w, height = h)#
+par(mar=margins)#
+plot(rho1, AMP3, col = 'red', ylim = c(0,1), type = 'n', ylab = 'MSE', xlab = 'rho')#
+segments(x0 = rho1, y0 = AMP1, y1 = AMP3, col = 'red')#
+points(rho1, AMP2, col = 'red', pch = 20)#
+#
+segments(x0 = rho2, y0 = BCR1, y1 = BCR3, col = 'blue')#
+points(rho2, BCR2, col = 'blue', pch = 20)#
+dev.off()#
+for(r in 1:n.rho) {#
+	AMP <- sort(abs(1-MSEs[r,,p+2+(1:p)]/MSEs[r,,2+(1:p)]))#
+	AMP1[r] <- quantile(AMP, .2)#
+	AMP2[r] <- mean(AMP)#
+	AMP3[r] <- quantile(AMP, .8)#
+	BCR <- abs(1-MSEs[r,,2*p+2+(1:p)]/MSEs[r,,2+(1:p)])#
+	BCR1[r] <- quantile(BCR, .2)#
+	BCR2[r] <- mean(BCR)#
+	BCR3[r] <- quantile(BCR, .8)#
+}#
+#
+pdf(file = paste("relEn", n, "p", p, "SNR2rep", n.rep, ".pdf", sep=''), width = w, height = h)#
+par(mar=margins)#
+plot(rho1, AMP3, col = 'red', ylim = c(0,1), type = 'n', ylab = 'Relative error', xlab = 'rho')#
+segments(x0 = rho1, y0 = AMP1, y1 = AMP3, col = 'red')#
+points(rho1, AMP2, col = 'red', pch = 20)#
+#
+segments(x0 = rho2, y0 = BCR1, y1 = BCR3, col = 'blue')#
+points(rho2, BCR2, col = 'blue', pch = 20)#
+dev.off()
